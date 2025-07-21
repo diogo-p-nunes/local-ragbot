@@ -1,13 +1,13 @@
-import sys
 import argparse
 import uuid
 from pathlib import Path
-import pprint
+from pydantic import BaseModel, Field
+from typing import Literal
 
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,12 +15,13 @@ from langchain_core.documents.base import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.tools.retriever import create_retriever_tool
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.text import Text
 
-from const_prompt import SYSTEM_PROMPT
+from const_prompt import SYSTEM_PROMPT, GRADE_PROMPT, REWRITE_PROMPT, ANSWER_PROMPT
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -28,31 +29,35 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="Chatbot parameters")
 parser.add_argument("--chat_model", type=str, default="qwen3:8b")
-parser.add_argument("--query_model", type=str, default="")
 parser.add_argument("--docs_dir", type=str, default="docs")
-parser.add_argument("--max_tokens", type=int, default=1000)
+parser.add_argument("--max_tokens", type=int, default=10000)
 parser.add_argument("--temperature", type=float, default=0.3)
 parser.add_argument("--stream", action="store_true")
+parser.add_argument("--plot_graph", action="store_true")
 args = parser.parse_args()
-
-# Query anc Chat models are the same by default
-if args.query_model == "":
-    args.query_model = args.chat_model
 
 # Ensure the docs directory exists
 Path(args.docs_dir).mkdir(exist_ok=True)
 
-# Load chat and query models
+# Load models
 chat_model = ChatOllama(
     model=args.chat_model,
     num_predict=args.max_tokens,
     temperature=args.temperature,
 )
 
+# These could have been different models, 
+# but for simplicity we use the same model
 query_model = ChatOllama(
-    model=args.query_model,
+    model=args.chat_model,
     num_predict=200,
     temperature=0.7,
+)
+
+grade_model = ChatOllama(
+    model=args.chat_model,
+    num_predict=200,
+    temperature=0, # deterministic for grading
 )
 
 # Define the chat prompt template
@@ -91,6 +96,7 @@ def load_chunked_documents() -> list[Document]:
 def generate_query_or_respond(state: MessagesState):
     """Call the model to generate a response based on the current state. Given
     the question, it will decide to retrieve using the retriever tool, or simply respond to the user.
+    IMPORTANT: The LLM decides by itself whether to use the retriever tool or not.
     """
     prompt = prompt_template.invoke(state["messages"])
     response = (
@@ -99,16 +105,80 @@ def generate_query_or_respond(state: MessagesState):
     )
     return {"messages": response}
 
-def call_model(state: MessagesState):
-    prompt = prompt_template.invoke(state["messages"])
-    response = chat_model.invoke(prompt)
-    return {"messages": response}
+class GradeDocuments(BaseModel):
+    """Grade documents using a binary score for relevance check."""
+    binary_score: Literal["good", "bad"] = Field(
+        description="Relevance score: 'good' if relevant, or 'bad' if not relevant"
+    )
+
+def grade_documents(state: MessagesState) -> Literal["generate_answer", "rewrite_question"]:
+    """Determine whether the retrieved documents are relevant to the question."""
+    # messaging order at this point: user question, tool call, tool response
+    question = state["messages"][-3].content
+    context = state["messages"][-1].content
+    prompt = GRADE_PROMPT.format(question=question, context=context)
+    response = (
+        grade_model.with_structured_output(GradeDocuments).invoke(
+            [{"role": "user", "content": prompt}]
+        )
+    )
+    score = response.binary_score
+    # NOTE: this is not a NODE, but a conditional edge
+    return "generate_answer" if score == "good" else "rewrite_question"
+
+def rewrite_question(state: MessagesState):
+    """Rewrite the original user question."""
+    question = state["messages"][-3].content
+    prompt = REWRITE_PROMPT.format(question=question)
+    response = query_model.invoke([{"role": "user", "content": prompt}])
+    return {"messages": [{"role": "user", "content": response.content}]}
+
+def generate_answer(state: MessagesState):
+    """Generate an answer."""
+    question = state["messages"][-3].content
+    context = state["messages"][-1].content
+    prompt = ANSWER_PROMPT.format(question=question, context=context)
+    response = chat_model.invoke([{"role": "user", "content": prompt}])
+    return {"messages": [response]}
+
+def plot_graph(agent_graph):
+    """Plot the agent graph"""
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    import io
+    # Assuming this returns PNG binary data
+    png_data = agent_graph.get_graph().draw_mermaid_png()
+    # Convert bytes to a PIL image
+    image = Image.open(io.BytesIO(png_data))
+    # Display with matplotlib
+    plt.figure(figsize=(8, 6))  # Adjust the figure size as needed
+    plt.imshow(image)
+    plt.axis('off')  # Hide axes
+    plt.show()
 
 # Define the agent graph; compile agent with memory for chat history
 workflow = StateGraph(state_schema=MessagesState)
 workflow.add_node(generate_query_or_respond)
+workflow.add_node("retrieve", ToolNode([retriever_tool]))
+workflow.add_node(rewrite_question)
+workflow.add_node(generate_answer)
+
 workflow.add_edge(START, "generate_query_or_respond")
+workflow.add_conditional_edges(
+    "generate_query_or_respond", 
+    tools_condition,
+    {'tools': 'retrieve',
+     'END': END}
+)
+workflow.add_conditional_edges(
+    "retrieve",
+    grade_documents
+)
+workflow.add_edge("generate_answer", END)
+workflow.add_edge("rewrite_question", "generate_query_or_respond")
 agent = workflow.compile(checkpointer=MemorySaver())
+
+if args.plot_graph: plot_graph(agent)
 
 def main(console: Console) -> None:
     EXIT = "/bye"
@@ -139,6 +209,7 @@ def main(console: Console) -> None:
                 {"messages": input_message},
                 {"configurable": {"thread_id": thread_id}},
             )
+            #result["messages"][-1].pretty_print()
             answer = Text(result["messages"][-1].content, style="green")
             console.print(label, answer)
 
