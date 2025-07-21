@@ -1,1 +1,1 @@
-SYSTEM_PROMPT = "You are a helpful assistant."
+SYSTEM_PROMPT = "You are a helpful assistant. Use the available tools to answer the user's question when you do not have a direct answer. If you can answer the question directly, do so without using the tools."
