@@ -168,7 +168,7 @@ workflow.add_conditional_edges(
     "generate_query_or_respond", 
     tools_condition,
     {'tools': 'retrieve',
-     'END': END}
+     END: END}
 )
 workflow.add_conditional_edges(
     "retrieve",
